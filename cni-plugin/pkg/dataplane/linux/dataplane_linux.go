@@ -64,6 +64,13 @@ func (d *linuxDataplane) DoNetworking(
 	hostVethName = desiredVethName
 	contVethName := args.IfName
 	var hasIPv4, hasIPv6 bool
+	var hostIPv6Addr net.IP
+
+	containerNS, err := ns.GetNS(args.Netns)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to open container netns %q: %v", args.Netns, err)
+	}
+	defer containerNS.Close()
 
 	d.logger.Infof("Setting the host side veth name to %s", hostVethName)
 
@@ -75,123 +82,113 @@ func (d *linuxDataplane) DoNetworking(
 		d.logger.Infof("Cleaning old hostVeth: %v", hostVethName)
 	}
 
-	err = ns.WithNetNSPath(args.Netns, func(hostNS ns.NetNS) error {
-		var hostIPv6Addr net.IP
-
-		la := netlink.NewLinkAttrs()
-		la.Name = contVethName
-		la.MTU = d.mtu
-		la.NumTxQueues = d.queues
-		la.NumRxQueues = d.queues
-		veth := &netlink.Veth{
-			LinkAttrs:     la,
-			PeerName:      hostVethName,
-			PeerNamespace: netlink.NsFd(int(hostNS.Fd())),
+	// Figure out whether we have IPv4 and/or IPv6 addresses.
+	for _, addr := range result.IPs {
+		if addr.Address.IP.To4() != nil {
+			hasIPv4 = true
+			addr.Address.Mask = net.CIDRMask(32, 32)
+		} else if addr.Address.IP.To16() != nil {
+			hasIPv6 = true
+			addr.Address.Mask = net.CIDRMask(128, 128)
 		}
+	}
 
-		if err := netlink.LinkAdd(veth); err != nil {
-			d.logger.Errorf("Error adding veth %+v: %s", veth, err)
-			return err
+	la := netlink.NewLinkAttrs()
+	la.Name = hostVethName
+	la.MTU = d.mtu
+	la.NumTxQueues = d.queues
+	la.NumRxQueues = d.queues
+	veth := &netlink.Veth{
+		LinkAttrs:     la,
+		PeerName:      contVethName,
+		PeerNamespace: netlink.NsFd(int(containerNS.Fd())),
+	}
+
+	if err := netlink.LinkAdd(veth); err != nil {
+		d.logger.Errorf("Error adding veth %+v: %s", veth, err)
+		return "", "", err
+	}
+
+	hostVeth, err := netlink.LinkByName(hostVethName)
+	if err != nil {
+		err = fmt.Errorf("failed to lookup %q: %v", hostVethName, err)
+		return "", "", err
+	}
+
+	if mac, err := net.ParseMAC("EE:EE:EE:EE:EE:EE"); err != nil {
+		d.logger.Infof("failed to parse MAC Address: %v. Using kernel generated MAC.", err)
+	} else {
+		// Set the MAC address on the host side interface so the kernel does not
+		// have to generate a persistent address which fails some times.
+		if err = netlink.LinkSetHardwareAddr(hostVeth, mac); err != nil {
+			d.logger.Warnf("failed to Set MAC of %q: %v. Using kernel generated MAC.", hostVethName, err)
 		}
+	}
 
-		// Figure out whether we have IPv4 and/or IPv6 addresses.
-		for _, addr := range result.IPs {
-			if addr.Address.IP.To4() != nil {
-				hasIPv4 = true
-				addr.Address.Mask = net.CIDRMask(32, 32)
-			} else if addr.Address.IP.To16() != nil {
-				hasIPv6 = true
-				addr.Address.Mask = net.CIDRMask(128, 128)
+	if hasIPv6 {
+		// By default, the kernel does duplicate address detection for the IPv6 address. DAD delays use of the
+		// IP for up to a second and we don't need it because it's a point-to-point link.
+		//
+		// This must be done before we set the links UP.
+		err := disableDAD(hostVethName)
+		if err != nil {
+			return "", "", err
+		}
+	}
+
+	err = d.configureSysctls(hostVethName, hasIPv4, hasIPv6)
+	if err != nil {
+		return "", "", fmt.Errorf("error configuring sysctls for interface: %s, error: %s", hostVethName, err)
+	}
+
+	// Explicitly set the veth to UP state; the veth won't get a link local address unless it's set to UP state.
+	if err = netlink.LinkSetUp(hostVeth); err != nil {
+		return "", "", fmt.Errorf("failed to set %q up: %w", hostVethName, err)
+	}
+
+	if hasIPv6 {
+		// Retry several times as the LL can take a several micro/milliseconds to initialize and we may be too fast
+		// after the configureSysctls call
+		var err error
+		var addresses []netlink.Addr
+		for i := 0; i < 10; i++ {
+			// No need to add a dummy next hop route as the host veth device will already have an IPv6
+			// link local address that can be used as a next hop.
+			// Just fetch the address of the host end of the veth and use it as the next hop.
+			addresses, err = netlink.AddrList(hostVeth, netlink.FAMILY_V6)
+			if err != nil {
+				d.logger.Errorf("Error listing IPv6 addresses for the host side of the veth pair: %s", err)
 			}
+
+			if len(addresses) < 1 {
+				// If the hostVeth doesn't have an IPv6 address then this host probably doesn't
+				// support IPv6. Since a IPv6 address has been allocated that can't be used,
+				// return an error.
+				err = fmt.Errorf("failed to get IPv6 addresses for host side of the veth pair")
+			}
+			if err == nil {
+				break
+			}
+
+			d.logger.Infof("No IPv6 set on interface, retrying..")
+			time.Sleep(50 * time.Millisecond)
 		}
 
+		if err != nil {
+			return "", "", err
+		}
+
+		hostIPv6Addr = addresses[0].IP
+	}
+
+	err = containerNS.Do(func(hostNS ns.NetNS) error {
 		if hasIPv6 {
-			// By default, the kernel does duplicate address detection for the IPv6 address. DAD delays use of the
-			// IP for up to a second and we don't need it because it's a point-to-point link.
-			//
-			// This must be done before we set the links UP.
+			//Disable DAD for container side
 			logrus.Debug("Interface has IPv6 address, disabling DAD.")
 			err = disableDAD(contVethName)
 			if err != nil {
 				return err
 			}
-		}
-
-		err = hostNS.Do(func(_ ns.NetNS) error {
-			hostVeth, err := netlink.LinkByName(hostVethName)
-			if err != nil {
-				err = fmt.Errorf("failed to lookup %q: %v", hostVethName, err)
-				return err
-			}
-
-			if mac, err := net.ParseMAC("EE:EE:EE:EE:EE:EE"); err != nil {
-				d.logger.Infof("failed to parse MAC Address: %v. Using kernel generated MAC.", err)
-			} else {
-				// Set the MAC address on the host side interface so the kernel does not
-				// have to generate a persistent address which fails some times.
-				if err = netlink.LinkSetHardwareAddr(hostVeth, mac); err != nil {
-					d.logger.Warnf("failed to Set MAC of %q: %v. Using kernel generated MAC.", hostVethName, err)
-				}
-			}
-
-			if hasIPv6 {
-				//Disable DAD for host side
-				err := disableDAD(hostVethName)
-				if err != nil {
-					return err
-				}
-			}
-
-			err = d.configureSysctls(hostVethName, hasIPv4, hasIPv6)
-			if err != nil {
-				return fmt.Errorf("error configuring sysctls for interface: %s, error: %s", hostVethName, err)
-			}
-
-			// Explicitly set the veth to UP state; the veth won't get a link local address unless it's set to UP state.
-			if err = netlink.LinkSetUp(hostVeth); err != nil {
-				return fmt.Errorf("failed to set %q up: %w", hostVethName, err)
-			}
-
-			if hasIPv6 {
-				// Retry several times as the LL can take a several micro/milliseconds to initialize and we may be too fast
-				// after the configureSysctls call in host namespace
-				var err error
-				var addresses []netlink.Addr
-				for i := 0; i < 10; i++ {
-					// No need to add a dummy next hop route as the host veth device will already have an IPv6
-					// link local address that can be used as a next hop.
-					// Just fetch the address of the host end of the veth and use it as the next hop.
-					addresses, err = netlink.AddrList(hostVeth, netlink.FAMILY_V6)
-					if err != nil {
-						d.logger.Errorf("Error listing IPv6 addresses for the host side of the veth pair: %s", err)
-					}
-
-					if len(addresses) < 1 {
-						// If the hostVeth doesn't have an IPv6 address then this host probably doesn't
-						// support IPv6. Since a IPv6 address has been allocated that can't be used,
-						// return an error.
-						err = fmt.Errorf("failed to get IPv6 addresses for host side of the veth pair")
-					}
-					if err == nil {
-						break
-					}
-
-					d.logger.Infof("No IPv6 set on interface, retrying..")
-					time.Sleep(50 * time.Millisecond)
-				}
-
-				if err != nil {
-					return err
-				}
-
-				hostIPv6Addr = addresses[0].IP
-			}
-
-			return nil
-		})
-
-		if err != nil {
-			return err
 		}
 
 		contVeth, err := netlink.LinkByName(contVethName)
@@ -228,9 +225,6 @@ func (d *linuxDataplane) DoNetworking(
 		}
 
 		d.logger.WithField("MAC", contVethMAC).Debug("Found MAC for container veth")
-
-		// At this point, the virtual ethernet pair has been created, and both ends have the right names.
-		// Both ends of the veth are still in the container's network namespace.
 
 		// Do the per-IP version set-up.  Add gateway routes etc.
 		if hasIPv4 {
@@ -304,13 +298,8 @@ func (d *linuxDataplane) DoNetworking(
 	})
 
 	if err != nil {
-		d.logger.Errorf("Error creating veth: %s", err)
+		d.logger.Errorf("Error configuring container veth: %s", err)
 		return "", "", err
-	}
-
-	hostVeth, err := netlink.LinkByName(hostVethName)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to lookup %q: %v", hostVethName, err)
 	}
 
 	// Add the routes to host veth in the host namespace.
