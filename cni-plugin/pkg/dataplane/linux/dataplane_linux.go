@@ -67,22 +67,17 @@ func (d *linuxDataplane) DoNetworking(
 
 	d.logger.Infof("Setting the host side veth name to %s", hostVethName)
 
-	hostNlHandle, err := netlink.NewHandle()
-	if err != nil {
-		return "", "", fmt.Errorf("failed to create host netlink handle: %v", err)
-	}
-
-	defer hostNlHandle.Close()
-
 	// Clean up if hostVeth exists.
-	if oldHostVeth, err := hostNlHandle.LinkByName(hostVethName); err == nil {
-		if err = hostNlHandle.LinkDel(oldHostVeth); err != nil {
+	if oldHostVeth, err := netlink.LinkByName(hostVethName); err == nil {
+		if err = netlink.LinkDel(oldHostVeth); err != nil {
 			return "", "", fmt.Errorf("failed to delete old hostVeth %v: %v", hostVethName, err)
 		}
 		d.logger.Infof("Cleaning old hostVeth: %v", hostVethName)
 	}
 
 	err = ns.WithNetNSPath(args.Netns, func(hostNS ns.NetNS) error {
+		var hostIPv6Addr net.IP
+
 		la := netlink.NewLinkAttrs()
 		la.Name = contVethName
 		la.MTU = d.mtu
@@ -97,22 +92,6 @@ func (d *linuxDataplane) DoNetworking(
 		if err := netlink.LinkAdd(veth); err != nil {
 			d.logger.Errorf("Error adding veth %+v: %s", veth, err)
 			return err
-		}
-
-		hostVeth, err := hostNlHandle.LinkByName(hostVethName)
-		if err != nil {
-			err = fmt.Errorf("failed to lookup %q: %v", hostVethName, err)
-			return err
-		}
-
-		if mac, err := net.ParseMAC("EE:EE:EE:EE:EE:EE"); err != nil {
-			d.logger.Infof("failed to parse MAC Address: %v. Using kernel generated MAC.", err)
-		} else {
-			// Set the MAC address on the host side interface so the kernel does not
-			// have to generate a persistent address which fails some times.
-			if err = hostNlHandle.LinkSetHardwareAddr(hostVeth, mac); err != nil {
-				d.logger.Warnf("failed to Set MAC of %q: %v. Using kernel generated MAC.", hostVethName, err)
-			}
 		}
 
 		// Figure out whether we have IPv4 and/or IPv6 addresses.
@@ -139,6 +118,22 @@ func (d *linuxDataplane) DoNetworking(
 		}
 
 		err = hostNS.Do(func(_ ns.NetNS) error {
+			hostVeth, err := netlink.LinkByName(hostVethName)
+			if err != nil {
+				err = fmt.Errorf("failed to lookup %q: %v", hostVethName, err)
+				return err
+			}
+
+			if mac, err := net.ParseMAC("EE:EE:EE:EE:EE:EE"); err != nil {
+				d.logger.Infof("failed to parse MAC Address: %v. Using kernel generated MAC.", err)
+			} else {
+				// Set the MAC address on the host side interface so the kernel does not
+				// have to generate a persistent address which fails some times.
+				if err = netlink.LinkSetHardwareAddr(hostVeth, mac); err != nil {
+					d.logger.Warnf("failed to Set MAC of %q: %v. Using kernel generated MAC.", hostVethName, err)
+				}
+			}
+
 			if hasIPv6 {
 				//Disable DAD for host side
 				err := disableDAD(hostVethName)
@@ -147,9 +142,49 @@ func (d *linuxDataplane) DoNetworking(
 				}
 			}
 
-			err := d.configureSysctls(hostVethName, hasIPv4, hasIPv6)
+			err = d.configureSysctls(hostVethName, hasIPv4, hasIPv6)
 			if err != nil {
 				return fmt.Errorf("error configuring sysctls for interface: %s, error: %s", hostVethName, err)
+			}
+
+			// Explicitly set the veth to UP state; the veth won't get a link local address unless it's set to UP state.
+			if err = netlink.LinkSetUp(hostVeth); err != nil {
+				return fmt.Errorf("failed to set %q up: %w", hostVethName, err)
+			}
+
+			if hasIPv6 {
+				// Retry several times as the LL can take a several micro/milliseconds to initialize and we may be too fast
+				// after the configureSysctls call in host namespace
+				var err error
+				var addresses []netlink.Addr
+				for i := 0; i < 10; i++ {
+					// No need to add a dummy next hop route as the host veth device will already have an IPv6
+					// link local address that can be used as a next hop.
+					// Just fetch the address of the host end of the veth and use it as the next hop.
+					addresses, err = netlink.AddrList(hostVeth, netlink.FAMILY_V6)
+					if err != nil {
+						d.logger.Errorf("Error listing IPv6 addresses for the host side of the veth pair: %s", err)
+					}
+
+					if len(addresses) < 1 {
+						// If the hostVeth doesn't have an IPv6 address then this host probably doesn't
+						// support IPv6. Since a IPv6 address has been allocated that can't be used,
+						// return an error.
+						err = fmt.Errorf("failed to get IPv6 addresses for host side of the veth pair")
+					}
+					if err == nil {
+						break
+					}
+
+					d.logger.Infof("No IPv6 set on interface, retrying..")
+					time.Sleep(50 * time.Millisecond)
+				}
+
+				if err != nil {
+					return err
+				}
+
+				hostIPv6Addr = addresses[0].IP
 			}
 
 			return nil
@@ -157,11 +192,6 @@ func (d *linuxDataplane) DoNetworking(
 
 		if err != nil {
 			return err
-		}
-
-		// Explicitly set the veth to UP state; the veth won't get a link local address unless it's set to UP state.
-		if err = hostNlHandle.LinkSetUp(hostVeth); err != nil {
-			return fmt.Errorf("failed to set %q up: %w", hostVethName, err)
 		}
 
 		contVeth, err := netlink.LinkByName(contVethName)
@@ -247,39 +277,6 @@ func (d *linuxDataplane) DoNetworking(
 				return fmt.Errorf("failed to set net.ipv6.conf.lo.disable_ipv6=0: %s", err)
 			}
 
-			// Retry several times as the LL can take a several micro/milliseconds to initialize and we may be too fast
-			// after the configureSysctls call in host namespace
-			var err error
-			var addresses []netlink.Addr
-			for i := 0; i < 10; i++ {
-				// No need to add a dummy next hop route as the host veth device will already have an IPv6
-				// link local address that can be used as a next hop.
-				// Just fetch the address of the host end of the veth and use it as the next hop.
-				addresses, err = hostNlHandle.AddrList(hostVeth, netlink.FAMILY_V6)
-				if err != nil {
-					d.logger.Errorf("Error listing IPv6 addresses for the host side of the veth pair: %s", err)
-				}
-
-				if len(addresses) < 1 {
-					// If the hostVeth doesn't have an IPv6 address then this host probably doesn't
-					// support IPv6. Since a IPv6 address has been allocated that can't be used,
-					// return an error.
-					err = fmt.Errorf("failed to get IPv6 addresses for host side of the veth pair")
-				}
-				if err == nil {
-					break
-				}
-
-				d.logger.Infof("No IPv6 set on interface, retrying..")
-				time.Sleep(50 * time.Millisecond)
-			}
-
-			if err != nil {
-				return err
-			}
-
-			hostIPv6Addr := addresses[0].IP
-
 			for _, r := range routes {
 				if r.IP.To4() != nil {
 					d.logger.WithField("route", r).Debug("Skipping non-IPv6 route")
@@ -311,13 +308,13 @@ func (d *linuxDataplane) DoNetworking(
 		return "", "", err
 	}
 
-	hostVeth, err := hostNlHandle.LinkByName(hostVethName)
+	hostVeth, err := netlink.LinkByName(hostVethName)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to lookup %q: %v", hostVethName, err)
 	}
 
 	// Add the routes to host veth in the host namespace.
-	err = SetupRoutes(hostNlHandle, hostVeth, result)
+	err = SetupRoutes(hostVeth, result)
 	if err != nil {
 		return "", "", fmt.Errorf("error adding host side routes for interface: %s, error: %s", hostVeth.Attrs().Name, err)
 	}
@@ -335,7 +332,7 @@ func disableDAD(contVethName string) error {
 }
 
 // SetupRoutes sets up the routes for the host side of the veth pair.
-func SetupRoutes(hostNlHandle *netlink.Handle, hostVeth netlink.Link, result *cniv1.Result) error {
+func SetupRoutes(hostVeth netlink.Link, result *cniv1.Result) error {
 
 	// Go through all the IPs and add routes for each IP in the result.
 	for _, ipAddr := range result.IPs {
@@ -344,7 +341,7 @@ func SetupRoutes(hostNlHandle *netlink.Handle, hostVeth netlink.Link, result *cn
 			Scope:     netlink.SCOPE_LINK,
 			Dst:       &ipAddr.Address,
 		}
-		err := hostNlHandle.RouteAdd(&route)
+		err := netlink.RouteAdd(&route)
 
 		if err != nil {
 			switch err {
@@ -352,7 +349,7 @@ func SetupRoutes(hostNlHandle *netlink.Handle, hostVeth netlink.Link, result *cn
 			// Route already exists, but not necessarily pointing to the same interface.
 			case syscall.EEXIST:
 				// List all the routes for the interface.
-				routes, err := hostNlHandle.RouteList(hostVeth, netlink.FAMILY_ALL)
+				routes, err := netlink.RouteList(hostVeth, netlink.FAMILY_ALL)
 				if err != nil {
 					return fmt.Errorf("error listing routes")
 				}
@@ -372,7 +369,7 @@ func SetupRoutes(hostNlHandle *netlink.Handle, hostVeth netlink.Link, result *cn
 				}
 
 				// Search all routes and report the conflict, search the name of the iface
-				routes, err = hostNlHandle.RouteList(nil, netlink.FAMILY_ALL)
+				routes, err = netlink.RouteList(nil, netlink.FAMILY_ALL)
 				if err != nil {
 					return fmt.Errorf("error listing routes")
 				}
@@ -382,7 +379,7 @@ func SetupRoutes(hostNlHandle *netlink.Handle, hostVeth netlink.Link, result *cn
 				for _, r := range routes {
 					if r.Dst != nil && r.Dst.IP.Equal(route.Dst.IP) {
 						linkName := "unknown"
-						if link, err := hostNlHandle.LinkByIndex(r.LinkIndex); err == nil {
+						if link, err := netlink.LinkByIndex(r.LinkIndex); err == nil {
 							linkName = link.Attrs().Name
 						}
 
